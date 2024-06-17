@@ -38,7 +38,8 @@ class Mamba2Simple(nn.Module):
         dt_limit=(0.0, float("inf")),
         learnable_init_states=False,
         activation="swish",
-        bimamba_type="none",
+        bimamba_type="v2",
+        bimamba=True,
         divide_out=False,
         bias=False,
         conv_bias=True,
@@ -176,7 +177,7 @@ class Mamba2Simple(nn.Module):
         dt_limit_kwargs = {} if self.dt_limit == (0.0, float("inf")) else dict(dt_limit=self.dt_limit)
 
         if self.use_mem_eff_path:
-            if self.bimamba_type == "v2":
+            if self.bimamba and self.bimamba_type == "v2":
                 A_bw = -torch.exp(self.A_b_log.float())
                 # Fully fused path
                 out_fw = mamba_split_conv1d_scan_combined(
@@ -257,7 +258,7 @@ class Mamba2Simple(nn.Module):
                     **dt_limit_kwargs,
                 )
         else:
-            if self.bimamba_type == "v2":
+            if self.bimamba and self.bimamba_type == "v2":
                 # Forward pass
                 z, xBC, dt = torch.split(
                     zxbcdt, [self.d_inner, self.d_inner + 2 * self.ngroups * self.d_state, self.nheads], dim=-1
