@@ -66,6 +66,7 @@ class Mamba2Simple(nn.Module):
         self.learnable_init_states = learnable_init_states
         self.activation = activation
         self.bimamba_type = bimamba_type
+        self.bimamba = bimamba
         self.chunk_size = chunk_size
         self.use_mem_eff_path = use_mem_eff_path
         self.layer_idx = layer_idx

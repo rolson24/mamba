@@ -10,12 +10,15 @@ from torch import Tensor
 
 from einops import rearrange, repeat
 
-from mamba_ssm.ops.selective_scan_interface import selective_scan_fn, mamba_inner_fn
-
 try:
     from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 except ImportError:
-    causal_conv1d_fn, causal_conv1d_update = None, None
+    causal_conv1d_fn, causal_conv1d_update = None
+
+try:
+    from mamba_ssm.ops.selective_scan_interface import selective_scan_fn, mamba_inner_fn, bimamba_inner_fn, mamba_inner_fn_no_out_proj
+except ImportError:
+    selective_scan_fn, mamba_inner_fn, bimamba_inner_fn, mamba_inner_fn_no_out_proj = None, None, None, None, None
 
 try:
     from mamba_ssm.ops.triton.selective_state_update import selective_state_update
@@ -23,7 +26,7 @@ except ImportError:
     selective_state_update = None
 
 try:
-    from mamba_ssm.ops.triton.layer_norm import RMSNorm, layer_norm_fn, rms_norm_fn
+    from mamba_ssm.ops.triton.layernorm import RMSNorm, layer_norm_fn, rms_norm_fn
 except ImportError:
     RMSNorm, layer_norm_fn, rms_norm_fn = None, None, None
 
@@ -47,6 +50,7 @@ class Mamba(nn.Module):
         layer_idx=None,
         device=None,
         dtype=None,
+        bimamba=True,
     ):
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
@@ -58,6 +62,7 @@ class Mamba(nn.Module):
         self.dt_rank = math.ceil(self.d_model / 16) if dt_rank == "auto" else dt_rank
         self.use_fast_path = use_fast_path
         self.layer_idx = layer_idx
+        self.bimamba = bimamba
 
         self.in_proj = nn.Linear(self.d_model, self.d_inner * 2, bias=bias, **factory_kwargs)
 
@@ -101,6 +106,7 @@ class Mamba(nn.Module):
         self.dt_proj.bias._no_reinit = True
 
         # S4D real initialization
+        # NOTE: why plus 1?
         A = repeat(
             torch.arange(1, self.d_state + 1, dtype=torch.float32, device=device),
             "n -> d n",
@@ -114,9 +120,39 @@ class Mamba(nn.Module):
         self.D = nn.Parameter(torch.ones(self.d_inner, device=device))  # Keep in fp32
         self.D._no_weight_decay = True
 
+        # bidirectional
+        # forked from https://github.com/hustvl/Vim
+        if self.bimamba:
+            A_b = repeat(
+                torch.arange(1, self.d_state + 1, dtype=torch.float32, device=device),
+                "n -> d n",
+                d=self.d_inner,
+            ).contiguous()
+            A_b_log = torch.log(A_b)  # Keep A_b_log in fp32
+            self.A_b_log = nn.Parameter(A_b_log)
+            self.A_b_log._no_weight_decay = True 
+
+            self.conv1d_b = nn.Conv1d(
+                in_channels=self.d_inner,
+                out_channels=self.d_inner,
+                bias=conv_bias,
+                kernel_size=d_conv,
+                groups=self.d_inner,
+                padding=d_conv - 1,
+                **factory_kwargs,
+            )
+
+            self.x_proj_b = nn.Linear(
+                self.d_inner, self.dt_rank + self.d_state * 2, bias=False, **factory_kwargs
+            )
+            self.dt_proj_b = nn.Linear(self.dt_rank, self.d_inner, bias=True, **factory_kwargs)
+
+            self.D_b = nn.Parameter(torch.ones(self.d_inner, device=device))  # Keep in fp32
+            self.D_b._no_weight_decay = True
+
         self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias, **factory_kwargs)
 
-    def forward(self, hidden_states, inference_params=None):
+    def forward(self, hidden_states, inference_params=None, T=1):
         """
         hidden_states: (B, L, D)
         Returns: same shape as hidden_states
@@ -132,6 +168,7 @@ class Mamba(nn.Module):
                 return out
 
         # We do matmul and transpose BLH -> HBL at the same time
+        # NOTE: same as in_proj(hidden_states) but memory-efficient with the following operations
         xz = rearrange(
             self.in_proj.weight @ rearrange(hidden_states, "b l d -> d (b l)"),
             "d (b l) -> b d l",
@@ -142,38 +179,66 @@ class Mamba(nn.Module):
 
         A = -torch.exp(self.A_log.float())  # (d_inner, d_state)
         # In the backward pass we write dx and dz next to each other to avoid torch.cat
-        if self.use_fast_path and causal_conv1d_fn is not None and inference_params is None:  # Doesn't support outputting the states
-            out = mamba_inner_fn(
-                xz,
-                self.conv1d.weight,
-                self.conv1d.bias,
-                self.x_proj.weight,
-                self.dt_proj.weight,
-                self.out_proj.weight,
-                self.out_proj.bias,
-                A,
-                None,  # input-dependent B
-                None,  # input-dependent C
-                self.D.float(),
-                delta_bias=self.dt_proj.bias.float(),
-                delta_softplus=True,
-            )
+        if self.use_fast_path and inference_params is None:  # Doesn't support outputting the states
+            if self.bimamba:
+                A_b = -torch.exp(self.A_b_log.float())
+                out = mamba_inner_fn_no_out_proj(
+                    xz,
+                    self.conv1d.weight,
+                    self.conv1d.bias,
+                    self.x_proj.weight,
+                    self.dt_proj.weight,
+                    A,
+                    None,  # input-dependent B
+                    None,  # input-dependent C
+                    self.D.float(),
+                    delta_bias=self.dt_proj.bias.float(),
+                    delta_softplus=True,
+                )
+                out_b = mamba_inner_fn_no_out_proj(
+                    xz.flip([-1]),
+                    self.conv1d_b.weight,
+                    self.conv1d_b.bias,
+                    self.x_proj_b.weight,
+                    self.dt_proj_b.weight,
+                    A_b,
+                    None,
+                    None,
+                    self.D_b.float(),
+                    delta_bias=self.dt_proj_b.bias.float(),
+                    delta_softplus=True,
+                )
+                out = F.linear(rearrange(out + out_b.flip([-1]), "b d l -> b l d"), self.out_proj.weight, self.out_proj.bias)
+            else:
+                out = mamba_inner_fn(
+                    xz,
+                    self.conv1d.weight,
+                    self.conv1d.bias,
+                    self.x_proj.weight,
+                    self.dt_proj.weight,
+                    self.out_proj.weight,
+                    self.out_proj.bias,
+                    A,
+                    None,  # input-dependent B
+                    None,  # input-dependent C
+                    self.D.float(),
+                    delta_bias=self.dt_proj.bias.float(),
+                    delta_softplus=True,
+                )
         else:
             x, z = xz.chunk(2, dim=1)
             # Compute short convolution
             if conv_state is not None:
-                # If we just take x[:, :, -self.d_conv :], it will error if seqlen < self.d_conv
-                # Instead F.pad will pad with zeros if seqlen < self.d_conv, and truncate otherwise.
-                conv_state.copy_(F.pad(x, (self.d_conv - x.shape[-1], 0)))  # Update state (B D W)
+                conv_state.copy_(x[:, :, -self.d_conv :])  # Update state (B D W)
             if causal_conv1d_fn is None:
                 x = self.act(self.conv1d(x)[..., :seqlen])
             else:
                 assert self.activation in ["silu", "swish"]
                 x = causal_conv1d_fn(
-                    x=x,
-                    weight=rearrange(self.conv1d.weight, "d 1 w -> d w"),
-                    bias=self.conv1d.bias,
-                    activation=self.activation,
+                    x,
+                    rearrange(self.conv1d.weight, "d 1 w -> d w"),
+                    self.conv1d.bias,
+                    self.activation,
                 )
 
             # We're careful here about the layout, to avoid extra transposes.
@@ -292,3 +357,62 @@ class Mamba(nn.Module):
                 conv_state.zero_()
                 ssm_state.zero_()
         return conv_state, ssm_state
+
+
+class Block(nn.Module):
+    def __init__(
+        self, dim, mixer_cls, norm_cls=nn.LayerNorm, fused_add_norm=False, residual_in_fp32=False
+    ):
+        """
+        Simple block wrapping a mixer class with LayerNorm/RMSNorm and residual connection"
+
+        This Block has a slightly different structure compared to a regular
+        prenorm Transformer block.
+        The standard block is: LN -> MHA/MLP -> Add.
+        [Ref: https://arxiv.org/abs/2002.04745]
+        Here we have: Add -> LN -> Mixer, returning both
+        the hidden_states (output of the mixer) and the residual.
+        This is purely for performance reasons, as we can fuse add and LayerNorm.
+        The residual needs to be provided (except for the very first block).
+        """
+        super().__init__()
+        self.residual_in_fp32 = residual_in_fp32
+        self.fused_add_norm = fused_add_norm
+        self.mixer = mixer_cls(dim)
+        self.norm = norm_cls(dim)
+        if self.fused_add_norm:
+            assert RMSNorm is not None, "RMSNorm import fails"
+            assert isinstance(
+                self.norm, (nn.LayerNorm, RMSNorm)
+            ), "Only LayerNorm and RMSNorm are supported for fused_add_norm"
+
+    def forward(
+        self, hidden_states: Tensor, residual: Optional[Tensor] = None, inference_params=None
+    ):
+        r"""Pass the input through the encoder layer.
+
+        Args:
+            hidden_states: the sequence to the encoder layer (required).
+            residual: hidden_states = Mixer(LN(residual))
+        """
+        if not self.fused_add_norm:
+            residual = (hidden_states + residual) if residual is not None else hidden_states
+            hidden_states = self.norm(residual.to(dtype=self.norm.weight.dtype))
+            if self.residual_in_fp32:
+                residual = residual.to(torch.float32)
+        else:
+            fused_add_norm_fn = rms_norm_fn if isinstance(self.norm, RMSNorm) else layer_norm_fn
+            hidden_states, residual = fused_add_norm_fn(
+                hidden_states,
+                self.norm.weight,
+                self.norm.bias,
+                residual=residual,
+                prenorm=True,
+                residual_in_fp32=self.residual_in_fp32,
+                eps=self.norm.eps,
+            )
+        hidden_states = self.mixer(hidden_states, inference_params=inference_params)
+        return hidden_states, residual
+
+    def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
+        return self.mixer.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype, **kwargs)
