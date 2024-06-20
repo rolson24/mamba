@@ -4,3 +4,5 @@ build/
 **.so
 .tmp.driveupload*
 dist/mamba_ssm-2.0.4-py3.10-linux-x86_64.egg
+*.hip
+*_hip.*
